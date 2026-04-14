@@ -24,9 +24,15 @@ jobs:
         env:
           PREDICTLEADS_API_KEY: ${{ secrets.PREDICTLEADS_API_KEY }}
           PREDICTLEADS_API_TOKEN: ${{ secrets.PREDICTLEADS_API_TOKEN }}
+
           DAYS_BACK: "7"
           PER_PAGE: "100"
-          MAX_PAGES: "1"
+
+          FETCH_COMPANY_JOBS: "true"
+          FETCH_GLOBAL_JOBS: "true"
+
+          MAX_COMPANY_PAGES: "1"
+          MAX_GLOBAL_PAGES: "1"
 
       - name: Upload output files
         uses: actions/upload-artifact@v4
