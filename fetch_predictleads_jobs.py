@@ -1,28 +1,91 @@
 import csv
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import requests
 
 
-PREDICTLEADS_URL = os.getenv(
-    "PREDICTLEADS_URL",
-    "https://api.predictleads.com/job_openings"
-)
+BASE_URL = "https://predictleads.com/api/v3"
 
 API_KEY = os.getenv("PREDICTLEADS_API_KEY", "").strip()
 API_TOKEN = os.getenv("PREDICTLEADS_API_TOKEN", "").strip()
 
 DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
 PER_PAGE = int(os.getenv("PER_PAGE", "100"))
-MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))
+MAX_GLOBAL_PAGES = int(os.getenv("MAX_GLOBAL_PAGES", "1"))
+MAX_COMPANY_PAGES = int(os.getenv("MAX_COMPANY_PAGES", "1"))
 
+FETCH_COMPANY_JOBS = os.getenv("FETCH_COMPANY_JOBS", "true").lower() == "true"
+FETCH_GLOBAL_JOBS = os.getenv("FETCH_GLOBAL_JOBS", "true").lower() == "true"
+
+COMPANIES_CSV = Path("companies.csv")
 OUTPUT_DIR = Path("output")
-RAW_JSON_PATH = OUTPUT_DIR / "raw_predictleads_response.json"
-CSV_PATH = OUTPUT_DIR / "predictleads_jobs_last_7_days_english.csv"
+
+COMPANY_CSV_PATH = OUTPUT_DIR / "company_jobs.csv"
+GLOBAL_CSV_PATH = OUTPUT_DIR / "global_jobs.csv"
+COMBINED_CSV_PATH = OUTPUT_DIR / "combined_predictleads_jobs.csv"
+
+RAW_COMPANY_JSON_PATH = OUTPUT_DIR / "raw_company_jobs.json"
+RAW_GLOBAL_JSON_PATH = OUTPUT_DIR / "raw_global_jobs.json"
+
+
+FIELDNAMES = [
+    "source",
+    "source_company_domain",
+
+    "id",
+    "type",
+
+    "title",
+    "translated_title",
+    "normalized_title",
+    "description",
+    "url",
+
+    "first_seen_at",
+    "last_seen_at",
+    "last_processed_at",
+    "posted_at",
+
+    "contract_types",
+    "categories",
+
+    "onet_code",
+    "onet_family",
+    "onet_occupation_name",
+
+    "recruiter_name",
+    "recruiter_title",
+    "recruiter_contact",
+
+    "salary",
+    "salary_low",
+    "salary_high",
+    "salary_currency",
+    "salary_low_usd",
+    "salary_high_usd",
+    "salary_time_unit",
+
+    "seniority",
+    "status",
+    "language",
+
+    "location",
+    "location_data",
+    "tags",
+
+    "company_id",
+    "company_name",
+    "company_domain",
+    "company_ticker",
+
+    "raw_json",
+]
 
 
 def safe_json(value: Any) -> str:
@@ -36,31 +99,85 @@ def safe_json(value: Any) -> str:
 def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
+
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
 
 
-def build_headers() -> Dict[str, str]:
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "predictleads-api-test/1.0",
+def is_recent_english_job(attrs: Dict[str, Any], cutoff: datetime) -> bool:
+    if attrs.get("language") != "en":
+        return False
+
+    last_seen_at = parse_dt(attrs.get("last_seen_at"))
+    if not last_seen_at:
+        return False
+
+    return last_seen_at >= cutoff
+
+
+def build_params(page: int) -> Dict[str, Any]:
+    return {
+        "api_key": API_KEY,
+        "api_token": API_TOKEN,
+        "page": page,
+        "per_page": PER_PAGE,
     }
 
-    if API_KEY:
-        headers["X-Api-Key"] = API_KEY
 
-    if API_TOKEN:
-        headers["Authorization"] = f"Bearer {API_TOKEN}"
+def request_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    clean_params = {k: v for k, v in params.items() if v not in ["", None]}
 
-    return headers
+    response = requests.get(
+        url,
+        params=clean_params,
+        headers={"Accept": "application/json"},
+        timeout=60,
+    )
+
+    print(f"[INFO] GET {response.url}")
+    print(f"[INFO] Status: {response.status_code}")
+
+    if response.status_code >= 400:
+        print("[ERROR] PredictLeads request failed:")
+        print(response.text[:3000])
+        response.raise_for_status()
+
+    return response.json()
+
+
+def read_company_domains() -> List[str]:
+    if not COMPANIES_CSV.exists():
+        print("[WARN] companies.csv not found. Company-specific fetch will be skipped.")
+        return []
+
+    domains = []
+
+    with COMPANIES_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+
+        if "company_domain" not in reader.fieldnames:
+            raise ValueError("companies.csv must have a header named company_domain")
+
+        for row in reader:
+            domain = (row.get("company_domain") or "").strip()
+            domain = domain.replace("https://", "").replace("http://", "")
+            domain = domain.replace("www.", "")
+            domain = domain.split("/")[0].strip()
+
+            if domain:
+                domains.append(domain)
+
+    unique_domains = sorted(set(domains))
+    print(f"[INFO] Loaded company domains: {len(unique_domains)}")
+    return unique_domains
 
 
 def company_lookup(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     lookup = {}
 
-    for item in included:
+    for item in included or []:
         if item.get("type") != "company":
             continue
 
@@ -78,7 +195,12 @@ def company_lookup(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return lookup
 
 
-def flatten_job(job: Dict[str, Any], companies: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def flatten_job(
+    job: Dict[str, Any],
+    companies: Dict[str, Dict[str, Any]],
+    source: str,
+    source_company_domain: str = "",
+) -> Dict[str, Any]:
     attrs = job.get("attributes", {}) or {}
 
     company_id = (
@@ -94,7 +216,10 @@ def flatten_job(job: Dict[str, Any], companies: Dict[str, Dict[str, Any]]) -> Di
     onet_data = attrs.get("onet_data") or {}
     recruiter_data = attrs.get("recruiter_data") or {}
 
-    return {
+    row = {
+        "source": source,
+        "source_company_domain": source_company_domain,
+
         "id": job.get("id"),
         "type": job.get("type"),
 
@@ -144,86 +269,178 @@ def flatten_job(job: Dict[str, Any], companies: Dict[str, Dict[str, Any]]) -> Di
         "raw_json": safe_json(job),
     }
 
+    return {field: row.get(field, "") for field in FIELDNAMES}
 
-def fetch_page(page: int) -> Dict[str, Any]:
-    params = {
-        "page": page,
-        "per_page": PER_PAGE,
-    }
 
-    response = requests.get(
-        PREDICTLEADS_URL,
-        headers=build_headers(),
-        params=params,
-        timeout=60,
+def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    domains = read_company_domains()
+    rows = []
+    raw_payloads = []
+
+    for index, domain in enumerate(domains, start=1):
+        print(f"\n[INFO] Company {index}/{len(domains)}: {domain}")
+
+        for page in range(1, MAX_COMPANY_PAGES + 1):
+            encoded_domain = quote(domain, safe="")
+            url = f"{BASE_URL}/companies/{encoded_domain}/job_openings"
+
+            try:
+                payload = request_json(url, build_params(page))
+            except Exception as exc:
+                print(f"[ERROR] Failed for company {domain}, page {page}: {exc}")
+                continue
+
+            raw_payloads.append({
+                "company_domain": domain,
+                "page": page,
+                "payload": payload,
+            })
+
+            companies = company_lookup(payload.get("included", []) or [])
+
+            page_jobs = payload.get("data", []) or []
+            if not page_jobs:
+                break
+
+            for job in page_jobs:
+                attrs = job.get("attributes", {}) or {}
+
+                if not is_recent_english_job(attrs, cutoff):
+                    continue
+
+                rows.append(
+                    flatten_job(
+                        job=job,
+                        companies=companies,
+                        source="company",
+                        source_company_domain=domain,
+                    )
+                )
+
+            time.sleep(0.2)
+
+    return rows, raw_payloads
+
+
+def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    rows = []
+    raw_payloads = []
+
+    for page in range(1, MAX_GLOBAL_PAGES + 1):
+        print(f"\n[INFO] Global jobs page {page}/{MAX_GLOBAL_PAGES}")
+
+        url = f"{BASE_URL}/discover/job_openings"
+
+        try:
+            payload = request_json(url, build_params(page))
+        except Exception as exc:
+            print(f"[ERROR] Failed global page {page}: {exc}")
+            continue
+
+        raw_payloads.append({
+            "page": page,
+            "payload": payload,
+        })
+
+        companies = company_lookup(payload.get("included", []) or [])
+
+        page_jobs = payload.get("data", []) or []
+        if not page_jobs:
+            break
+
+        for job in page_jobs:
+            attrs = job.get("attributes", {}) or {}
+
+            if not is_recent_english_job(attrs, cutoff):
+                continue
+
+            rows.append(
+                flatten_job(
+                    job=job,
+                    companies=companies,
+                    source="global",
+                )
+            )
+
+        time.sleep(0.2)
+
+    return rows, raw_payloads
+
+
+def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    deduped = []
+
+    for row in rows:
+        key = row.get("id") or row.get("url")
+
+        if not key:
+            key = f"{row.get('company_domain')}|{row.get('title')}|{row.get('location')}"
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(row)
+
+    return deduped
+
+
+def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
-
-    print(f"Page {page}: {response.status_code}")
-
-    if response.status_code >= 400:
-        print(response.text[:3000])
-        response.raise_for_status()
-
-    return response.json()
 
 
 def main() -> None:
-    if not API_KEY and not API_TOKEN:
-        raise RuntimeError("Missing PREDICTLEADS_API_KEY or PREDICTLEADS_API_TOKEN")
+    if not API_KEY or not API_TOKEN:
+        raise RuntimeError(
+            "Missing PredictLeads credentials. Add both PREDICTLEADS_API_KEY and PREDICTLEADS_API_TOKEN as GitHub Secrets."
+        )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)
 
-    all_payloads = []
-    rows = []
+    print(f"[INFO] DAYS_BACK: {DAYS_BACK}")
+    print(f"[INFO] Cutoff last_seen_at: {cutoff.isoformat()}")
+    print(f"[INFO] FETCH_COMPANY_JOBS: {FETCH_COMPANY_JOBS}")
+    print(f"[INFO] FETCH_GLOBAL_JOBS: {FETCH_GLOBAL_JOBS}")
 
-    for page in range(1, MAX_PAGES + 1):
-        payload = fetch_page(page)
-        all_payloads.append(payload)
+    company_rows = []
+    global_rows = []
+    raw_company_payloads = []
+    raw_global_payloads = []
 
-        companies = company_lookup(payload.get("included", []) or [])
+    if FETCH_COMPANY_JOBS:
+        company_rows, raw_company_payloads = fetch_company_jobs(cutoff)
 
-        for job in payload.get("data", []) or []:
-            attrs = job.get("attributes", {}) or {}
+    if FETCH_GLOBAL_JOBS:
+        global_rows, raw_global_payloads = fetch_global_jobs(cutoff)
 
-            if attrs.get("language") != "en":
-                continue
+    combined_rows = dedupe_rows(company_rows + global_rows)
 
-            last_seen_at = parse_dt(attrs.get("last_seen_at"))
-            if not last_seen_at or last_seen_at < cutoff:
-                continue
+    write_csv(COMPANY_CSV_PATH, company_rows)
+    write_csv(GLOBAL_CSV_PATH, global_rows)
+    write_csv(COMBINED_CSV_PATH, combined_rows)
 
-            rows.append(flatten_job(job, companies))
+    write_json(RAW_COMPANY_JSON_PATH, raw_company_payloads)
+    write_json(RAW_GLOBAL_JSON_PATH, raw_global_payloads)
 
-    RAW_JSON_PATH.write_text(
-        json.dumps(all_payloads, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    fieldnames = [
-        "id", "type",
-        "title", "translated_title", "normalized_title", "description", "url",
-        "first_seen_at", "last_seen_at", "last_processed_at", "posted_at",
-        "contract_types", "categories",
-        "onet_code", "onet_family", "onet_occupation_name",
-        "recruiter_name", "recruiter_title", "recruiter_contact",
-        "salary", "salary_low", "salary_high", "salary_currency",
-        "salary_low_usd", "salary_high_usd", "salary_time_unit",
-        "seniority", "status", "language",
-        "location", "location_data", "tags",
-        "company_id", "company_name", "company_domain", "company_ticker",
-        "raw_json",
-    ]
-
-    with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"Done. Rows saved: {len(rows)}")
-    print(f"CSV: {CSV_PATH}")
-    print(f"Raw JSON: {RAW_JSON_PATH}")
+    print("\n[DONE]")
+    print(f"Company jobs saved: {len(company_rows)} -> {COMPANY_CSV_PATH}")
+    print(f"Global jobs saved: {len(global_rows)} -> {GLOBAL_CSV_PATH}")
+    print(f"Combined deduped jobs saved: {len(combined_rows)} -> {COMBINED_CSV_PATH}")
+    print(f"Raw company JSON -> {RAW_COMPANY_JSON_PATH}")
+    print(f"Raw global JSON -> {RAW_GLOBAL_JSON_PATH}")
 
 
 if __name__ == "__main__":
