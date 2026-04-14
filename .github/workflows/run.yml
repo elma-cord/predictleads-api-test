@@ -27,6 +27,7 @@ jobs:
 
           DAYS_BACK: "7"
           PER_PAGE: "100"
+          MAX_OUTPUT_ROWS: "100"
 
           FETCH_COMPANY_JOBS: "true"
           FETCH_GLOBAL_JOBS: "true"
