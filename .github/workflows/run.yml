@@ -26,8 +26,13 @@ jobs:
           PREDICTLEADS_API_TOKEN: ${{ secrets.PREDICTLEADS_API_TOKEN }}
 
           DAYS_BACK: "7"
-          PER_PAGE: "100"
+
+          COMPANY_PER_PAGE: "10"
+          GLOBAL_PER_PAGE: "10"
+          REQUEST_TIMEOUT_SECONDS: "120"
+
           GLOBAL_LOCATION: "United Kingdom"
+          COMPANY_LOCATION_FILTER: "United Kingdom"
 
           FETCH_COMPANY_JOBS: "true"
           FETCH_GLOBAL_JOBS: "true"
