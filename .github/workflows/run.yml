@@ -38,8 +38,8 @@ jobs:
           FETCH_COMPANY_JOBS: "true"
           FETCH_GLOBAL_JOBS: "true"
 
-          MAX_COMPANIES: "0"
-          MAX_COMPANY_PAGES: "10"
+          MAX_COMPANIES: "100"
+          MAX_COMPANY_PAGES: "1"
           MAX_GLOBAL_PAGES: "10"
 
           MAX_COMPANY_JOBS: "1000"
