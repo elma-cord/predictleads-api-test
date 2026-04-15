@@ -13,7 +13,6 @@ import requests
 BASE_URL = "https://predictleads.com/api/v3"
 
 API_KEY = os.getenv("PREDICTLEADS_API_KEY", "").strip()
-API_TOKEN = os.getenv("PREDICTLEADS_API_TOKEN", "").strip()
 
 DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
 PER_PAGE = int(os.getenv("PER_PAGE", "100"))
@@ -36,45 +35,16 @@ RAW_GLOBAL_JSON_PATH = OUTPUT_DIR / "raw_global_jobs.json"
 
 
 FIELDNAMES = [
-    "source",
-    "source_company_domain",
-    "id",
-    "type",
-    "title",
-    "translated_title",
-    "normalized_title",
-    "description",
-    "url",
-    "first_seen_at",
-    "last_seen_at",
-    "last_processed_at",
-    "posted_at",
-    "contract_types",
-    "categories",
-    "onet_code",
-    "onet_family",
-    "onet_occupation_name",
-    "recruiter_name",
-    "recruiter_title",
-    "recruiter_contact",
-    "salary",
-    "salary_low",
-    "salary_high",
-    "salary_currency",
-    "salary_low_usd",
-    "salary_high_usd",
-    "salary_time_unit",
-    "seniority",
-    "status",
-    "language",
-    "location",
-    "location_data",
-    "tags",
-    "company_id",
-    "company_name",
-    "company_domain",
-    "company_ticker",
-    "raw_json",
+    "source", "source_company_domain", "id", "type", "title",
+    "translated_title", "normalized_title", "description", "url",
+    "first_seen_at", "last_seen_at", "last_processed_at", "posted_at",
+    "contract_types", "categories", "onet_code", "onet_family",
+    "onet_occupation_name", "recruiter_name", "recruiter_title",
+    "recruiter_contact", "salary", "salary_low", "salary_high",
+    "salary_currency", "salary_low_usd", "salary_high_usd",
+    "salary_time_unit", "seniority", "status", "language",
+    "location", "location_data", "tags", "company_id",
+    "company_name", "company_domain", "company_ticker", "raw_json",
 ]
 
 
@@ -100,16 +70,12 @@ def is_recent_english_job(attrs: Dict[str, Any], cutoff: datetime) -> bool:
         return False
 
     last_seen_at = parse_dt(attrs.get("last_seen_at"))
-    if not last_seen_at:
-        return False
-
-    return last_seen_at >= cutoff
+    return bool(last_seen_at and last_seen_at >= cutoff)
 
 
 def build_params(page: int) -> Dict[str, Any]:
     return {
         "api_key": API_KEY,
-        "api_token": API_TOKEN,
         "page": page,
         "per_page": PER_PAGE,
     }
@@ -379,9 +345,9 @@ def write_json(path: Path, data: Any) -> None:
 
 
 def main() -> None:
-    if not API_KEY or not API_TOKEN:
+    if not API_KEY:
         raise RuntimeError(
-            "Missing PredictLeads credentials. Add both PREDICTLEADS_API_KEY and PREDICTLEADS_API_TOKEN as GitHub Secrets."
+            "Missing PredictLeads credential. Add PREDICTLEADS_API_KEY as a GitHub Secret."
         )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
