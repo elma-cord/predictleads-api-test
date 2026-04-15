@@ -23,6 +23,7 @@ jobs:
         run: python fetch_predictleads_jobs.py
         env:
           PREDICTLEADS_API_KEY: ${{ secrets.PREDICTLEADS_API_KEY }}
+          PREDICTLEADS_API_TOKEN: ${{ secrets.PREDICTLEADS_API_TOKEN }}
 
           DAYS_BACK: "7"
           PER_PAGE: "100"
