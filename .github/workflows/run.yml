@@ -31,7 +31,8 @@ jobs:
           GLOBAL_PER_PAGE: "10"
           REQUEST_TIMEOUT_SECONDS: "120"
 
-          GLOBAL_LOCATION: "London, England, United Kingdom"
+          GLOBAL_LOCATION: "United Kingdom"
+          GLOBAL_ONET_CODES: "15-1252.00"
           COMPANY_LOCATION_FILTER: "United Kingdom"
 
           FETCH_COMPANY_JOBS: "true"
