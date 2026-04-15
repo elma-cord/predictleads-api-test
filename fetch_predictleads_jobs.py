@@ -18,6 +18,8 @@ API_TOKEN = os.getenv("PREDICTLEADS_API_TOKEN", "").strip()
 DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
 PER_PAGE = int(os.getenv("PER_PAGE", "100"))
 
+GLOBAL_LOCATION = os.getenv("GLOBAL_LOCATION", "United Kingdom").strip()
+
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "10"))
 MAX_COMPANY_PAGES = int(os.getenv("MAX_COMPANY_PAGES", "1"))
 MAX_GLOBAL_PAGES = int(os.getenv("MAX_GLOBAL_PAGES", "1"))
@@ -41,16 +43,17 @@ RAW_GLOBAL_JSON_PATH = OUTPUT_DIR / "raw_global_jobs.json"
 
 
 FIELDNAMES = [
-    "source", "source_company_domain", "id", "type", "title",
-    "translated_title", "normalized_title", "description", "url",
-    "first_seen_at", "last_seen_at", "last_processed_at", "posted_at",
-    "contract_types", "categories", "onet_code", "onet_family",
-    "onet_occupation_name", "recruiter_name", "recruiter_title",
-    "recruiter_contact", "salary", "salary_low", "salary_high",
-    "salary_currency", "salary_low_usd", "salary_high_usd",
-    "salary_time_unit", "seniority", "status", "language",
-    "location", "location_data", "tags", "company_id",
-    "company_name", "company_domain", "company_ticker", "raw_json",
+    "source", "source_company_domain", "global_location",
+    "id", "type", "title", "translated_title", "normalized_title",
+    "description", "url", "first_seen_at", "last_seen_at",
+    "last_processed_at", "posted_at", "contract_types", "categories",
+    "onet_code", "onet_family", "onet_occupation_name",
+    "recruiter_name", "recruiter_title", "recruiter_contact",
+    "salary", "salary_low", "salary_high", "salary_currency",
+    "salary_low_usd", "salary_high_usd", "salary_time_unit",
+    "seniority", "status", "language", "location", "location_data",
+    "tags", "company_id", "company_name", "company_domain",
+    "company_ticker", "raw_json",
 ]
 
 
@@ -79,13 +82,18 @@ def is_recent_english_job(attrs: Dict[str, Any], cutoff: datetime) -> bool:
     return bool(last_seen_at and last_seen_at >= cutoff)
 
 
-def build_params(page: int) -> Dict[str, Any]:
-    return {
+def build_params(page: int, include_global_location: bool = False) -> Dict[str, Any]:
+    params = {
         "api_key": API_KEY,
         "api_token": API_TOKEN,
         "page": page,
         "per_page": PER_PAGE,
     }
+
+    if include_global_location:
+        params["location"] = GLOBAL_LOCATION
+
+    return params
 
 
 def request_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -166,6 +174,7 @@ def flatten_job(
     companies: Dict[str, Dict[str, Any]],
     source: str,
     source_company_domain: str = "",
+    global_location: str = "",
 ) -> Dict[str, Any]:
     attrs = job.get("attributes", {}) or {}
 
@@ -185,6 +194,7 @@ def flatten_job(
     row = {
         "source": source,
         "source_company_domain": source_company_domain,
+        "global_location": global_location,
         "id": job.get("id"),
         "type": job.get("type"),
         "title": attrs.get("title"),
@@ -297,17 +307,19 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
             break
 
         print(f"\n[INFO] Global jobs page {page}/{MAX_GLOBAL_PAGES}")
+        print(f"[INFO] Global location: {GLOBAL_LOCATION}")
 
         url = f"{BASE_URL}/discover/job_openings"
 
         try:
-            payload = request_json(url, build_params(page))
+            payload = request_json(url, build_params(page, include_global_location=True))
         except Exception as exc:
             print(f"[ERROR] Failed global page {page}: {exc}")
             continue
 
         raw_payloads.append({
             "page": page,
+            "location": GLOBAL_LOCATION,
             "payload": payload,
         })
 
@@ -331,6 +343,7 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
                     job=job,
                     companies=companies,
                     source="global company",
+                    global_location=GLOBAL_LOCATION,
                 )
             )
 
@@ -384,6 +397,7 @@ def main() -> None:
 
     print(f"[INFO] DAYS_BACK: {DAYS_BACK}")
     print(f"[INFO] Cutoff last_seen_at: {cutoff.isoformat()}")
+    print(f"[INFO] GLOBAL_LOCATION: {GLOBAL_LOCATION}")
     print(f"[INFO] MAX_COMPANIES: {MAX_COMPANIES}")
     print(f"[INFO] MAX_COMPANY_JOBS: {MAX_COMPANY_JOBS}")
     print(f"[INFO] MAX_GLOBAL_JOBS: {MAX_GLOBAL_JOBS}")
