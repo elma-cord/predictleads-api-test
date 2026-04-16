@@ -22,6 +22,8 @@ REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
 
 COMPANIES_CSV = Path("companies.csv")
+COMPANIES_CAREER_PAGES_CSV = Path("companies_career_pages.csv")
+
 BLACKLIST_CSV = Path("blacklist.csv")
 CUSTOMERS_CSV = Path("customers.csv")
 CHURNED_CSV = Path("churned.csv")
@@ -93,6 +95,14 @@ def normalize_url(value: Any) -> str:
 def company_website(domain: str) -> str:
     domain = normalize_domain(domain)
     return f"https://{domain}"
+
+
+def domain_from_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        return normalize_domain(parsed.netloc)
+    except Exception:
+        return ""
 
 
 def clean_page_text(text: str, max_chars: int = 30000) -> str:
@@ -206,7 +216,7 @@ def load_reference_data() -> Dict[str, Any]:
 
 def read_company_domains() -> List[str]:
     if not COMPANIES_CSV.exists():
-        raise FileNotFoundError("companies.csv not found")
+        return []
 
     domains = []
 
@@ -233,8 +243,64 @@ def read_company_domains() -> List[str]:
     if MAX_COMPANIES > 0:
         unique_domains = unique_domains[:MAX_COMPANIES]
 
-    print(f"[INFO] Loaded companies for this run: {len(unique_domains)}")
+    print(f"[INFO] Loaded company domains for this run: {len(unique_domains)}")
     return unique_domains
+
+
+def read_direct_career_pages() -> List[Dict[str, str]]:
+    """
+    Reads companies_career_pages.csv if it exists.
+
+    Expected format:
+    career_page
+    https://example.com/careers
+    https://example.com/jobs
+    """
+    if not COMPANIES_CAREER_PAGES_CSV.exists():
+        print("[INFO] companies_career_pages.csv not found. Will use companies.csv instead.")
+        return []
+
+    pages = []
+
+    with COMPANIES_CAREER_PAGES_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+
+        if "career_page" not in (reader.fieldnames or []):
+            raise ValueError("companies_career_pages.csv must have a header named career_page")
+
+        for row in reader:
+            career_page = normalize_url(row.get("career_page"))
+            if not career_page:
+                continue
+
+            if not career_page.startswith("http"):
+                career_page = "https://" + career_page
+
+            company_domain = domain_from_url(career_page)
+
+            if not company_domain:
+                continue
+
+            pages.append({
+                "company_domain": company_domain,
+                "career_page": career_page,
+            })
+
+    unique_pages = []
+    seen = set()
+
+    for item in pages:
+        key = normalize_url(item["career_page"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_pages.append(item)
+
+    if MAX_COMPANIES > 0:
+        unique_pages = unique_pages[:MAX_COMPANIES]
+
+    print(f"[INFO] Loaded direct career pages for this run: {len(unique_pages)}")
+    return unique_pages
 
 
 def company_matches(company_domain: str, company_name: str, domains: Set[str], names: Set[str]) -> bool:
@@ -386,7 +452,36 @@ def find_career_pages(domain: str) -> List[str]:
     return unique[:15]
 
 
-def collect_career_page_text(domain: str) -> tuple[List[Dict[str, str]], List[str]]:
+def html_to_page_text(html: str, max_chars: int = 30000) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    return clean_page_text(soup.get_text(" "), max_chars=max_chars)
+
+
+def collect_career_page_text_from_direct_url(domain: str, career_page_url: str) -> tuple[List[Dict[str, str]], List[str]]:
+    pages = []
+    successful_urls = []
+
+    html = fetch_html(career_page_url)
+    if not html:
+        return pages, successful_urls
+
+    text = html_to_page_text(html, max_chars=35000)
+
+    if len(text) >= 150:
+        pages.append({
+            "url": career_page_url,
+            "text": text,
+        })
+        successful_urls.append(career_page_url)
+
+    return pages, successful_urls
+
+
+def collect_career_page_text_from_domain(domain: str) -> tuple[List[Dict[str, str]], List[str]]:
     career_urls = find_career_pages(domain)
     pages = []
     successful_urls = []
@@ -396,12 +491,7 @@ def collect_career_page_text(domain: str) -> tuple[List[Dict[str, str]], List[st
         if not html:
             continue
 
-        soup = BeautifulSoup(html, "html.parser")
-
-        for tag in soup(["script", "style", "noscript", "svg"]):
-            tag.decompose()
-
-        text = clean_page_text(soup.get_text(" "), max_chars=30000)
+        text = html_to_page_text(html, max_chars=30000)
 
         if len(text) < 150:
             continue
@@ -539,6 +629,69 @@ def write_json(path: Path, data: Any) -> None:
     )
 
 
+def process_company(
+    client: genai.Client,
+    domain: str,
+    pages: List[Dict[str, str]],
+    successful_urls: List[str],
+    ref: Dict[str, Any],
+    checked_at: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows = []
+
+    company_raw = {
+        "company_domain": domain,
+        "career_pages_checked": successful_urls,
+        "jobs": [],
+        "error": "",
+    }
+
+    try:
+        jobs = extract_jobs_with_gemini(client, domain, pages)
+    except Exception as exc:
+        print(f"[ERROR] Gemini failed for {domain}: {exc}")
+        company_raw["error"] = str(exc)
+        return rows, company_raw
+
+    for job in jobs:
+        company_name = str(job.get("company_name") or "").strip()
+        job_title = str(job.get("job_title") or "").strip()
+        job_url = normalize_url(job.get("job_url"))
+        job_location = str(job.get("job_location") or "").strip()
+        confidence = str(job.get("confidence") or "").strip()
+        reason = str(job.get("reason") or "").strip()
+
+        if not job_title:
+            continue
+
+        if not job_url and successful_urls:
+            job_url = successful_urls[0]
+
+        row = {
+            "List": "",
+            "source": "gemini direct career page" if COMPANIES_CAREER_PAGES_CSV.exists() else "gemini company website",
+            "company_domain": domain,
+            "company_name": company_name,
+            "career_page_url": successful_urls[0] if successful_urls else "",
+            "job_title": job_title,
+            "job_url": job_url,
+            "job_location": job_location,
+            "confidence": confidence,
+            "reason": reason,
+            "checked_at_utc": checked_at,
+        }
+
+        if should_remove_job(row, ref):
+            continue
+
+        row["List"] = assign_list_value(domain, company_name, ref)
+
+        rows.append(row)
+        company_raw["jobs"].append(row)
+
+    return rows, company_raw
+
+
 def main() -> None:
     if not GEMINI_API_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY. Add it as a GitHub Secret.")
@@ -547,77 +700,66 @@ def main() -> None:
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     ref = load_reference_data()
-    domains = read_company_domains()
-
-    all_rows = []
-    raw_results = []
     checked_at = datetime.now(timezone.utc).isoformat()
 
-    for index, domain in enumerate(domains, start=1):
-        print(f"\n[INFO] Company {index}/{len(domains)}: {domain}")
+    direct_pages = read_direct_career_pages()
+    all_rows = []
+    raw_results = []
 
-        pages, successful_urls = collect_career_page_text(domain)
+    if direct_pages:
+        print("[INFO] Using companies_career_pages.csv direct career page mode.")
 
-        company_raw = {
-            "company_domain": domain,
-            "career_pages_checked": successful_urls,
-            "jobs": [],
-            "error": "",
-        }
+        for index, item in enumerate(direct_pages, start=1):
+            domain = item["company_domain"]
+            career_page = item["career_page"]
 
-        try:
-            jobs = extract_jobs_with_gemini(client, domain, pages)
-        except Exception as exc:
-            print(f"[ERROR] Gemini failed for {domain}: {exc}")
-            company_raw["error"] = str(exc)
+            print(f"\n[INFO] Career page {index}/{len(direct_pages)}: {career_page}")
+
+            pages, successful_urls = collect_career_page_text_from_direct_url(domain, career_page)
+
+            rows, company_raw = process_company(
+                client=client,
+                domain=domain,
+                pages=pages,
+                successful_urls=successful_urls,
+                ref=ref,
+                checked_at=checked_at,
+            )
+
+            all_rows.extend(rows)
             raw_results.append(company_raw)
-            continue
-
-        for job in jobs:
-            company_name = str(job.get("company_name") or "").strip()
-            job_title = str(job.get("job_title") or "").strip()
-            job_url = normalize_url(job.get("job_url"))
-            job_location = str(job.get("job_location") or "").strip()
-            confidence = str(job.get("confidence") or "").strip()
-            reason = str(job.get("reason") or "").strip()
-
-            if not job_title:
-                continue
-
-            if not job_url and successful_urls:
-                job_url = successful_urls[0]
-
-            row = {
-                "List": "",
-                "source": "gemini company website",
-                "company_domain": domain,
-                "company_name": company_name,
-                "career_page_url": successful_urls[0] if successful_urls else "",
-                "job_title": job_title,
-                "job_url": job_url,
-                "job_location": job_location,
-                "confidence": confidence,
-                "reason": reason,
-                "checked_at_utc": checked_at,
-            }
-
-            if should_remove_job(row, ref):
-                continue
-
-            row["List"] = assign_list_value(domain, company_name, ref)
-
-            all_rows.append(row)
-            company_raw["jobs"].append(row)
 
             if len(all_rows) >= MAX_JOBS_OUTPUT:
                 break
 
-        raw_results.append(company_raw)
+            time.sleep(SLEEP_SECONDS)
 
-        if len(all_rows) >= MAX_JOBS_OUTPUT:
-            break
+    else:
+        print("[INFO] Using companies.csv domain discovery mode.")
 
-        time.sleep(SLEEP_SECONDS)
+        domains = read_company_domains()
+
+        for index, domain in enumerate(domains, start=1):
+            print(f"\n[INFO] Company {index}/{len(domains)}: {domain}")
+
+            pages, successful_urls = collect_career_page_text_from_domain(domain)
+
+            rows, company_raw = process_company(
+                client=client,
+                domain=domain,
+                pages=pages,
+                successful_urls=successful_urls,
+                ref=ref,
+                checked_at=checked_at,
+            )
+
+            all_rows.extend(rows)
+            raw_results.append(company_raw)
+
+            if len(all_rows) >= MAX_JOBS_OUTPUT:
+                break
+
+            time.sleep(SLEEP_SECONDS)
 
     all_rows = dedupe_rows(all_rows)
     all_rows = all_rows[:MAX_JOBS_OUTPUT]
