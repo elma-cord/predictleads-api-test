@@ -17,7 +17,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
       - name: Fetch company jobs with Gemini
         run: python fetch_company_jobs_gemini.py
@@ -27,7 +29,9 @@ jobs:
 
           MAX_COMPANIES: "5"
           MAX_JOBS_OUTPUT: "500"
-          REQUEST_TIMEOUT_SECONDS: "30"
+          MAX_JOB_LINKS_PER_COMPANY: "50"
+
+          REQUEST_TIMEOUT_SECONDS: "45"
           SLEEP_SECONDS: "1"
 
       - name: Upload output files
