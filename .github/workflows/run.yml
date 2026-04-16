@@ -27,8 +27,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: "gemini-2.5-flash"
 
-          MAX_COMPANIES: "5"
-          MAX_JOBS_OUTPUT: "500"
+          MAX_COMPANIES: "50"
+          MAX_JOBS_OUTPUT: "2000"
           MAX_JOB_LINKS_PER_COMPANY: "50"
 
           REQUEST_TIMEOUT_SECONDS: "45"
