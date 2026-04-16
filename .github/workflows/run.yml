@@ -1,10 +1,10 @@
-name: PredictLeads API Test
+name: Company Jobs Gemini Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  fetch-predictleads-jobs:
+  fetch-company-jobs-gemini:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,35 +19,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch PredictLeads jobs
-        run: python fetch_predictleads_jobs.py
+      - name: Fetch company jobs with Gemini
+        run: python fetch_company_jobs_gemini.py
         env:
-          PREDICTLEADS_API_KEY: ${{ secrets.PREDICTLEADS_API_KEY }}
-          PREDICTLEADS_API_TOKEN: ${{ secrets.PREDICTLEADS_API_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-2.5-flash"
 
-          HOURS_BACK: "24"
-
-          COMPANY_PER_PAGE: "100"
-          GLOBAL_PER_PAGE: "100"
-          REQUEST_TIMEOUT_SECONDS: "120"
-
-          GLOBAL_LOCATION: "United Kingdom"
-          GLOBAL_ONET_CODES: "15-1252.00"
-          COMPANY_LOCATION_FILTER: "United Kingdom"
-
-          FETCH_COMPANY_JOBS: "true"
-          FETCH_GLOBAL_JOBS: "true"
-
-          MAX_COMPANIES: "100"
-          MAX_COMPANY_PAGES: "1"
-          MAX_GLOBAL_PAGES: "10"
-
-          MAX_COMPANY_JOBS: "1000"
-          MAX_GLOBAL_JOBS: "1000"
-          MAX_OUTPUT_ROWS: "2000"
+          MAX_COMPANIES: "5"
+          MAX_JOBS_OUTPUT: "500"
+          REQUEST_TIMEOUT_SECONDS: "30"
+          SLEEP_SECONDS: "1"
 
       - name: Upload output files
         uses: actions/upload-artifact@v4
         with:
-          name: predictleads-output
+          name: gemini-company-jobs-output
           path: output/
