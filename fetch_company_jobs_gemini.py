@@ -5,8 +5,8 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urljoin, urlparse
+from typing import Any, Dict, List, Set
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from google import genai
@@ -26,6 +26,9 @@ MAX_JOB_LINKS_PER_COMPANY = int(os.getenv("MAX_JOB_LINKS_PER_COMPANY", "50"))
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "45"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
+
+MIN_JOB_DESCRIPTION_CHARS = int(os.getenv("MIN_JOB_DESCRIPTION_CHARS", "300"))
+MAX_JOB_DESCRIPTION_CHARS = int(os.getenv("MAX_JOB_DESCRIPTION_CHARS", "60000"))
 
 COMPANIES_CSV = Path("companies.csv")
 COMPANIES_CAREER_PAGES_CSV = Path("companies_career_pages.csv")
@@ -110,6 +113,26 @@ NON_JOB_LINK_KEYWORDS = [
     "youtube",
 ]
 
+CLOSED_OR_INVALID_JOB_SIGNALS = [
+    "page not found",
+    "404",
+    "not found",
+    "vacancy is no longer available",
+    "job is no longer available",
+    "position is no longer available",
+    "this job is closed",
+    "this vacancy has closed",
+    "applications are closed",
+    "no longer accepting applications",
+    "this role is closed",
+    "this position has been filled",
+    "job has expired",
+    "vacancy has expired",
+    "expired vacancy",
+    "sorry, this vacancy is no longer available",
+    "the page you are looking for could not be found",
+]
+
 
 # =========================================================
 # NORMALIZATION HELPERS
@@ -156,9 +179,63 @@ def same_or_subdomain(url: str, company_domain: str) -> bool:
         return False
 
 
-def clean_page_text(text: str, max_chars: int = 60000) -> str:
+def clean_page_text(text: str, max_chars: int = 70000) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     return text[:max_chars]
+
+
+def clean_job_description(text: str) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+
+    # Remove common cookie/navigation noise, but keep the full role content.
+    noise_patterns = [
+        r"(?i)cookie policy.*?(accept all|reject all|manage preferences)",
+        r"(?i)we use cookies.*?(accept|reject|manage)",
+        r"(?i)skip to content",
+        r"(?i)share this job",
+    ]
+
+    for pattern in noise_patterns:
+        text = re.sub(pattern, " ", text)
+
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:MAX_JOB_DESCRIPTION_CHARS]
+
+
+def is_closed_or_invalid_page(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return True
+
+    return any(signal in normalized for signal in CLOSED_OR_INVALID_JOB_SIGNALS)
+
+
+def has_real_job_description(text: str) -> bool:
+    cleaned = clean_job_description(text)
+    if len(cleaned) < MIN_JOB_DESCRIPTION_CHARS:
+        return False
+
+    if is_closed_or_invalid_page(cleaned):
+        return False
+
+    # Require at least some role-like content.
+    role_signals = [
+        "responsibilities",
+        "requirements",
+        "the role",
+        "about the role",
+        "job description",
+        "what you will do",
+        "what you'll do",
+        "essential criteria",
+        "key responsibilities",
+        "skills",
+        "experience",
+        "apply",
+    ]
+
+    normalized = normalize_text(cleaned)
+    return any(signal in normalized for signal in role_signals)
 
 
 def safe_json(value: Any) -> str:
@@ -436,7 +513,7 @@ def safe_goto(page, url: str) -> bool:
         return False
 
 
-def rendered_page_text(page, max_chars: int = 60000) -> str:
+def rendered_page_text(page, max_chars: int = 70000) -> str:
     try:
         text = page.locator("body").inner_text(timeout=5000)
         return clean_page_text(text, max_chars=max_chars)
@@ -451,7 +528,63 @@ def rendered_html(page) -> str:
         return ""
 
 
-def extract_rendered_links(page, base_url: str, company_domain: str, job_like_only: bool = False) -> List[Dict[str, str]]:
+def extract_nearby_job_cards(page) -> List[Dict[str, str]]:
+    """
+    Extract visible link/card context from rendered page.
+    This helps Gemini match job titles to real URLs.
+    """
+    try:
+        cards = page.evaluate(
+            """
+            () => {
+              const links = Array.from(document.querySelectorAll('a[href]'));
+              return links.map(a => {
+                let container = a;
+                for (let i = 0; i < 6; i++) {
+                  if (container.parentElement) container = container.parentElement;
+                }
+                return {
+                  href: a.href,
+                  link_text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
+                  nearby_text: (container.innerText || '').trim().slice(0, 1500)
+                };
+              });
+            }
+            """
+        )
+    except Exception:
+        cards = []
+
+    cleaned = []
+    seen = set()
+
+    for card in cards:
+        href = normalize_url(card.get("href", ""))
+        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=1500)
+        link_text = str(card.get("link_text") or "").strip()
+
+        if not href or not nearby_text:
+            continue
+
+        combined = normalize_text(f"{href} {link_text} {nearby_text}")
+        if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
+            continue
+
+        key = f"{href}|{nearby_text[:100]}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        cleaned.append({
+            "href": href,
+            "link_text": link_text,
+            "nearby_text": nearby_text,
+        })
+
+    return cleaned[:120]
+
+
+def extract_rendered_links(page, company_domain: str, job_like_only: bool = False) -> List[Dict[str, str]]:
     try:
         links = page.evaluate(
             """
@@ -487,10 +620,10 @@ def extract_rendered_links(page, base_url: str, company_domain: str, job_like_on
         if job_like_only and not any(keyword in combined for keyword in JOB_LINK_KEYWORDS):
             continue
 
-        key = href
-        if key in seen:
+        if href in seen:
             continue
-        seen.add(key)
+
+        seen.add(href)
 
         output.append({
             "text": text,
@@ -501,58 +634,6 @@ def extract_rendered_links(page, base_url: str, company_domain: str, job_like_on
     return output
 
 
-def extract_nearby_job_cards(page) -> List[Dict[str, str]]:
-    """
-    Extracts visible link/card context from rendered page.
-    This helps Gemini match job titles to real URLs.
-    """
-    try:
-        cards = page.evaluate(
-            """
-            () => {
-              const links = Array.from(document.querySelectorAll('a[href]'));
-              return links.map(a => {
-                let container = a;
-                for (let i = 0; i < 5; i++) {
-                  if (container.parentElement) container = container.parentElement;
-                }
-                return {
-                  href: a.href,
-                  link_text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
-                  nearby_text: (container.innerText || '').trim().slice(0, 1200)
-                };
-              });
-            }
-            """
-        )
-    except Exception:
-        cards = []
-
-    cleaned = []
-    seen = set()
-
-    for card in cards:
-        href = normalize_url(card.get("href", ""))
-        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=1200)
-        link_text = str(card.get("link_text") or "").strip()
-
-        if not href or not nearby_text:
-            continue
-
-        key = f"{href}|{nearby_text[:100]}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        cleaned.append({
-            "href": href,
-            "link_text": link_text,
-            "nearby_text": nearby_text,
-        })
-
-    return cleaned[:80]
-
-
 def find_career_pages_from_domain(context, domain: str) -> List[str]:
     home_url = company_website(domain)
     page = context.new_page()
@@ -561,7 +642,7 @@ def find_career_pages_from_domain(context, domain: str) -> List[str]:
     career_urls = []
 
     if safe_goto(page, home_url):
-        links = extract_rendered_links(page, home_url, domain, job_like_only=False)
+        links = extract_rendered_links(page, domain, job_like_only=False)
 
         for link in links:
             combined = normalize_text(f"{link.get('href')} {link.get('text')}")
@@ -660,13 +741,15 @@ def extract_structured_dates_from_html(html: str) -> List[Dict[str, str]]:
         "datePosted",
     ]
 
+    normalized_meta_names = {normalize_text(x) for x in meta_names}
+
     for meta in soup.find_all("meta"):
         name = meta.get("name") or meta.get("property") or ""
         content = meta.get("content") or ""
         if not name or not content:
             continue
 
-        if normalize_text(name) in {normalize_text(x) for x in meta_names}:
+        if normalize_text(name) in normalized_meta_names:
             dates.append({
                 "date": str(content),
                 "source": f"meta_{name}",
@@ -688,7 +771,7 @@ def first_structured_date(html: str) -> tuple[str, str]:
 # =========================================================
 
 def build_career_page_prompt(company_domain: str, career_page_url: str, page_text: str, job_cards: List[Dict[str, str]]) -> str:
-    cards_text = json.dumps(job_cards[:80], ensure_ascii=False, indent=2)
+    cards_text = json.dumps(job_cards[:120], ensure_ascii=False, indent=2)
 
     return f"""
 You are extracting currently open job vacancies from a rendered company career page.
@@ -742,7 +825,7 @@ def build_job_page_prompt(
     structured_posted_date_source: str,
 ) -> str:
     return f"""
-You are extracting structured data from a job page.
+You are extracting structured data from an open job page.
 
 Company domain: {company_domain}
 Job URL: {job_url}
@@ -755,6 +838,10 @@ Rules:
 - No markdown.
 - Do not invent information.
 - Extract only what is explicitly present in the job page text or structured posted date fields.
+- If the page says page not found, job not found, vacancy unavailable, expired, closed, or does not contain a real job description, return:
+  {{"is_valid_open_job": false}}
+- Otherwise return:
+  {{"is_valid_open_job": true, ...fields...}}
 - job_posted_date:
   - Use the structured posted date if provided.
   - Otherwise only extract a visible posted/published date if explicitly shown in the job page text.
@@ -763,17 +850,19 @@ Rules:
   - If using structured posted date, return the provided structured source.
   - If using visible text, return "visible_text".
   - If no date exists, return empty string.
-- job_description should be a concise but useful summary of the role based on the page. Do not copy the full page.
+- Do NOT summarize job_description.
+- job_description should be the full cleaned job description text from the job page, preserving the main sections as much as possible.
+- Remove navigation/header/footer/cookie text if obvious.
 - confidence should be "high", "medium", or "low".
 - reason should be short.
 
 Return this JSON shape:
 {{
+  "is_valid_open_job": true,
   "company_name": "",
   "job_title": "",
   "job_url": "",
   "job_location": "",
-  "job_description": "",
   "job_posted_date": "",
   "job_posted_date_source": "",
   "confidence": "",
@@ -840,7 +929,7 @@ def enrich_job_page_with_gemini(
     prompt = build_job_page_prompt(
         company_domain=company_domain,
         job_url=job_url,
-        job_page_text=job_page_text,
+        job_page_text=job_page_text[:70000],
         structured_posted_date=structured_posted_date,
         structured_posted_date_source=structured_posted_date_source,
     )
@@ -867,15 +956,8 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
 
     if not seed_url:
         return {
-            "company_name": str(job_seed.get("company_name") or "").strip(),
-            "job_title": str(job_seed.get("job_title") or "").strip(),
-            "job_url": "",
-            "job_location": str(job_seed.get("job_location") or "").strip(),
-            "job_description": "",
-            "job_posted_date": "",
-            "job_posted_date_source": "",
-            "confidence": str(job_seed.get("confidence") or "medium").strip(),
-            "reason": str(job_seed.get("reason") or "Extracted from career page; no specific job URL found.").strip(),
+            "is_valid_open_job": False,
+            "invalid_reason": "No specific job URL found.",
         }
 
     page = context.new_page()
@@ -888,24 +970,20 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
     try:
         if safe_goto(page, seed_url):
             final_url = normalize_url(page.url)
-            page_text = rendered_page_text(page, max_chars=70000)
+            page_text = rendered_page_text(page, max_chars=90000)
             html = rendered_html(page)
     finally:
         page.close()
 
     structured_date, structured_source = first_structured_date(html)
+    cleaned_description = clean_job_description(page_text)
 
-    if not page_text:
+    if not has_real_job_description(cleaned_description):
         return {
-            "company_name": str(job_seed.get("company_name") or "").strip(),
-            "job_title": str(job_seed.get("job_title") or "").strip(),
+            "is_valid_open_job": False,
+            "invalid_reason": "Job page is closed, invalid, not found, or has no real job description.",
             "job_url": final_url or seed_url,
-            "job_location": str(job_seed.get("job_location") or "").strip(),
-            "job_description": "",
-            "job_posted_date": structured_date,
-            "job_posted_date_source": structured_source,
-            "confidence": str(job_seed.get("confidence") or "medium").strip(),
-            "reason": "Job page opened but text extraction was limited.",
+            "job_page_text_sample": page_text[:1000],
         }
 
     try:
@@ -913,7 +991,7 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
             client=client,
             company_domain=company_domain,
             job_url=final_url or seed_url,
-            job_page_text=page_text,
+            job_page_text=cleaned_description,
             structured_posted_date=structured_date,
             structured_posted_date_source=structured_source,
         )
@@ -921,12 +999,21 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
         print(f"[WARN] Gemini job-page enrichment failed for {seed_url}: {exc}")
         enriched = {}
 
+    if enriched.get("is_valid_open_job") is False:
+        return {
+            "is_valid_open_job": False,
+            "invalid_reason": "Gemini classified job page as invalid/closed.",
+            "job_url": final_url or seed_url,
+        }
+
     return {
+        "is_valid_open_job": True,
         "company_name": str(enriched.get("company_name") or job_seed.get("company_name") or "").strip(),
         "job_title": str(enriched.get("job_title") or job_seed.get("job_title") or "").strip(),
         "job_url": normalize_url(enriched.get("job_url") or final_url or seed_url),
         "job_location": str(enriched.get("job_location") or job_seed.get("job_location") or "").strip(),
-        "job_description": str(enriched.get("job_description") or "").strip(),
+        # Full description comes from Playwright page text, not from Gemini summary.
+        "job_description": cleaned_description,
         "job_posted_date": str(enriched.get("job_posted_date") or structured_date or "").strip(),
         "job_posted_date_source": str(enriched.get("job_posted_date_source") or structured_source or "").strip(),
         "confidence": str(enriched.get("confidence") or job_seed.get("confidence") or "medium").strip(),
@@ -953,6 +1040,7 @@ def process_career_page(
         "career_page_url": career_page_url,
         "job_seeds": [],
         "jobs": [],
+        "skipped_jobs": [],
         "error": "",
     }
 
@@ -965,11 +1053,11 @@ def process_career_page(
             raw["error"] = "Could not open career page."
             return rows, raw
 
-        page_text = rendered_page_text(page, max_chars=70000)
+        page_text = rendered_page_text(page, max_chars=90000)
         job_cards = extract_nearby_job_cards(page)
 
         raw["career_page_text_sample"] = page_text[:5000]
-        raw["job_cards_sample"] = job_cards[:20]
+        raw["job_cards_sample"] = job_cards[:30]
 
         job_seeds = extract_jobs_from_career_page_with_gemini(
             client=client,
@@ -993,15 +1081,32 @@ def process_career_page(
     for seed in job_seeds:
         job_data = open_job_page_and_extract(context, client, company_domain, seed)
 
+        if not job_data.get("is_valid_open_job"):
+            raw["skipped_jobs"].append({
+                "seed": seed,
+                "reason": job_data.get("invalid_reason", "Invalid or closed job page."),
+                "job_url": job_data.get("job_url", seed.get("job_url", "")),
+            })
+            continue
+
         job_title = str(job_data.get("job_title") or "").strip()
         if not job_title:
+            raw["skipped_jobs"].append({
+                "seed": seed,
+                "reason": "Missing job title after job page extraction.",
+                "job_url": job_data.get("job_url", seed.get("job_url", "")),
+            })
             continue
 
         company_name = str(job_data.get("company_name") or "").strip()
         job_url = normalize_url(job_data.get("job_url") or seed.get("job_url") or "")
 
         if not job_url:
-            job_url = career_page_url
+            raw["skipped_jobs"].append({
+                "seed": seed,
+                "reason": "Missing job URL.",
+            })
+            continue
 
         row = {
             "List": "",
@@ -1020,7 +1125,20 @@ def process_career_page(
             "checked_at_utc": checked_at,
         }
 
+        if not has_real_job_description(row["job_description"]):
+            raw["skipped_jobs"].append({
+                "seed": seed,
+                "reason": "Final row removed because job_description is missing/too short/invalid.",
+                "job_url": job_url,
+            })
+            continue
+
         if should_remove_job(row, ref):
+            raw["skipped_jobs"].append({
+                "seed": seed,
+                "reason": "Removed by blacklist/customers/current jobs/irrelevant names logic.",
+                "job_url": job_url,
+            })
             continue
 
         row["List"] = assign_list_value(company_domain, company_name, ref)
