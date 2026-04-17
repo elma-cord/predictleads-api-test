@@ -23,6 +23,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "5"))
 MAX_JOBS_OUTPUT = int(os.getenv("MAX_JOBS_OUTPUT", "500"))
 MAX_JOB_LINKS_PER_COMPANY = int(os.getenv("MAX_JOB_LINKS_PER_COMPANY", "50"))
+MAX_SECONDARY_PAGES_PER_COMPANY = int(os.getenv("MAX_SECONDARY_PAGES_PER_COMPANY", "5"))
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "45"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
@@ -107,6 +108,24 @@ JOB_LINK_KEYWORDS = [
     "learn more",
 ]
 
+NEXT_PAGE_KEYWORDS = [
+    "open positions",
+    "positions",
+    "vacancies",
+    "current vacancies",
+    "view vacancies",
+    "see vacancies",
+    "see jobs",
+    "view jobs",
+    "job openings",
+    "open roles",
+    "browse roles",
+    "search jobs",
+    "find jobs",
+    "opportunities",
+    "join our team",
+]
+
 JOB_URL_PATTERNS = [
     "/jobs/",
     "/job/",
@@ -132,6 +151,25 @@ JOB_URL_PATTERNS = [
     "icims.com",
     "jobvite.com",
     "personio.com",
+    "oraclecloud.com",
+]
+
+ATS_HOST_PATTERNS = [
+    "greenhouse.io",
+    "lever.co",
+    "workable.com",
+    "ashbyhq.com",
+    "smartrecruiters.com",
+    "pinpointhq.com",
+    "bamboohr.com",
+    "recruitee.com",
+    "teamtailor.com",
+    "workdayjobs.com",
+    "myworkdayjobs.com",
+    "icims.com",
+    "jobvite.com",
+    "personio.com",
+    "oraclecloud.com",
 ]
 
 NON_JOB_LINK_KEYWORDS = [
@@ -276,6 +314,11 @@ def has_real_job_description(text: str) -> bool:
     return any(signal in normalized for signal in role_signals)
 
 
+def is_ats_url(url: str) -> bool:
+    url_norm = normalize_text(url)
+    return any(pattern in url_norm for pattern in ATS_HOST_PATTERNS)
+
+
 def is_likely_job_url(url: str, text: str = "", nearby_text: str = "") -> bool:
     combined = normalize_text(f"{url} {text} {nearby_text}")
     if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
@@ -285,6 +328,21 @@ def is_likely_job_url(url: str, text: str = "", nearby_text: str = "") -> bool:
         return True
 
     if any(keyword in combined for keyword in JOB_LINK_KEYWORDS):
+        return True
+
+    return False
+
+
+def is_likely_next_page(url: str, text: str = "", nearby_text: str = "") -> bool:
+    combined = normalize_text(f"{url} {text} {nearby_text}")
+
+    if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
+        return False
+
+    if is_ats_url(url):
+        return True
+
+    if any(keyword in combined for keyword in NEXT_PAGE_KEYWORDS):
         return True
 
     return False
@@ -572,11 +630,42 @@ def rendered_html(page) -> str:
         return ""
 
 
+def expand_page(page) -> None:
+    try:
+        page.mouse.wheel(0, 1500)
+        time.sleep(0.5)
+        page.mouse.wheel(0, 1500)
+        time.sleep(0.5)
+        page.mouse.wheel(0, 3000)
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    click_texts = [
+        "Open positions",
+        "Vacancies",
+        "View vacancies",
+        "See vacancies",
+        "View jobs",
+        "See jobs",
+        "Job openings",
+        "Open roles",
+        "View all jobs",
+        "Current vacancies",
+        "Join our team",
+    ]
+
+    for text in click_texts:
+        try:
+            locator = page.get_by_text(text, exact=False).first
+            if locator.count() > 0 and locator.is_visible(timeout=1000):
+                locator.click(timeout=2000)
+                time.sleep(1)
+        except Exception:
+            continue
+
+
 def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
-    """
-    Extracts visible link/card context from rendered page.
-    This helps Gemini match job titles to real URLs.
-    """
     try:
         cards = page.evaluate(
             """
@@ -610,7 +699,8 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
         if not href or not nearby_text:
             continue
 
-        if not same_or_subdomain(href, company_domain):
+        # Allow same-domain pages and external ATS pages
+        if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
 
         if not is_likely_job_url(href, link_text, nearby_text):
@@ -630,7 +720,7 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
     return cleaned[:150]
 
 
-def extract_rendered_links(page, company_domain: str, job_like_only: bool = False) -> List[Dict[str, str]]:
+def extract_next_page_candidates(page, company_domain: str) -> List[str]:
     try:
         links = page.evaluate(
             """
@@ -644,7 +734,7 @@ def extract_rendered_links(page, company_domain: str, job_like_only: bool = Fals
     except Exception:
         links = []
 
-    output = []
+    candidates = []
     seen = set()
 
     for item in links:
@@ -655,29 +745,20 @@ def extract_rendered_links(page, company_domain: str, job_like_only: bool = Fals
         if not href or not href.startswith("http"):
             continue
 
-        if not same_or_subdomain(href, company_domain):
+        if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
 
-        combined = normalize_text(f"{href} {text} {outer_html}")
+        combined_extra = f"{text} {outer_html}"
 
-        if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
-            continue
-
-        if job_like_only and not is_likely_job_url(href, text, outer_html):
+        if not is_likely_next_page(href, text, combined_extra):
             continue
 
         if href in seen:
             continue
-
         seen.add(href)
+        candidates.append(href)
 
-        output.append({
-            "text": text,
-            "href": href,
-            "outer_html": outer_html,
-        })
-
-    return output
+    return candidates[:20]
 
 
 def find_career_pages_from_domain(context, domain: str) -> List[str]:
@@ -688,12 +769,13 @@ def find_career_pages_from_domain(context, domain: str) -> List[str]:
     career_urls = []
 
     if safe_goto(page, home_url):
-        links = extract_rendered_links(page, domain, job_like_only=False)
+        expand_page(page)
+        candidates = extract_next_page_candidates(page, domain)
 
-        for link in links:
-            combined = normalize_text(f"{link.get('href')} {link.get('text')}")
-            if any(keyword in combined for keyword in CAREER_LINK_KEYWORDS):
-                career_urls.append(link["href"])
+        for href in candidates:
+            combined = normalize_text(href)
+            if any(keyword in combined for keyword in CAREER_LINK_KEYWORDS) or is_ats_url(href):
+                career_urls.append(href)
 
     page.close()
 
@@ -1015,6 +1097,7 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
     try:
         if safe_goto(page, seed_url):
             final_url = normalize_url(page.url)
+            expand_page(page)
             page_text = rendered_page_text(page, max_chars=90000)
             html = rendered_html(page)
     finally:
@@ -1092,23 +1175,26 @@ def add_skipped_job(
     })
 
 
-def process_career_page(
+def process_single_rendered_page(
     context,
     client: genai.Client,
     company_domain: str,
-    career_page_url: str,
+    root_career_page_url: str,
+    page_url: str,
     ref: Dict[str, Any],
     checked_at: str,
     skipped_jobs_debug: List[Dict[str, Any]],
-) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
     rows = []
 
     raw = {
         "company_domain": company_domain,
-        "career_page_url": career_page_url,
+        "career_page_url": root_career_page_url,
+        "processed_page_url": page_url,
         "job_seeds": [],
         "jobs": [],
         "skipped_jobs": [],
+        "next_pages": [],
         "error": "",
     }
 
@@ -1116,21 +1202,24 @@ def process_career_page(
     page.route("**/*", block_unneeded_requests)
 
     try:
-        ok = safe_goto(page, career_page_url)
+        ok = safe_goto(page, page_url)
         if not ok:
-            raw["error"] = "Could not open career page."
-            return rows, raw
+            raw["error"] = "Could not open page."
+            return rows, raw, []
 
+        expand_page(page)
         page_text = rendered_page_text(page, max_chars=90000)
         job_cards = extract_nearby_job_cards(page, company_domain)
+        next_pages = extract_next_page_candidates(page, company_domain)
 
         raw["career_page_text_sample"] = page_text[:5000]
         raw["job_cards_sample"] = job_cards[:30]
+        raw["next_pages"] = next_pages[:20]
 
         job_seeds = extract_jobs_from_career_page_with_gemini(
             client=client,
             company_domain=company_domain,
-            career_page_url=career_page_url,
+            career_page_url=page_url,
             page_text=page_text,
             job_cards=job_cards,
         )
@@ -1139,8 +1228,8 @@ def process_career_page(
 
     except Exception as exc:
         raw["error"] = str(exc)
-        print(f"[ERROR] Failed career page {career_page_url}: {exc}")
-        return rows, raw
+        print(f"[ERROR] Failed page {page_url}: {exc}")
+        return rows, raw, []
     finally:
         page.close()
 
@@ -1154,18 +1243,17 @@ def process_career_page(
             final_job_url = job_data.get("job_url", seed.get("job_url", ""))
             sample = job_data.get("job_page_text_sample", "")
 
-            raw_skip = {
+            raw["skipped_jobs"].append({
                 "seed": seed,
                 "reason": reason,
                 "job_url": final_job_url,
                 "job_page_text_sample": sample,
-            }
-            raw["skipped_jobs"].append(raw_skip)
+            })
 
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
-                career_page_url=career_page_url,
+                career_page_url=root_career_page_url,
                 seed=seed,
                 reason=reason,
                 checked_at=checked_at,
@@ -1188,7 +1276,7 @@ def process_career_page(
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
-                career_page_url=career_page_url,
+                career_page_url=root_career_page_url,
                 seed=seed,
                 reason=reason,
                 checked_at=checked_at,
@@ -1210,7 +1298,7 @@ def process_career_page(
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
-                career_page_url=career_page_url,
+                career_page_url=root_career_page_url,
                 seed=seed,
                 reason=reason,
                 checked_at=checked_at,
@@ -1222,7 +1310,7 @@ def process_career_page(
             "source": "playwright + gemini",
             "company_domain": company_domain,
             "company_name": company_name,
-            "career_page_url": career_page_url,
+            "career_page_url": root_career_page_url,
             "job_title": job_title,
             "job_url": job_url,
             "job_location": str(job_data.get("job_location") or "").strip(),
@@ -1247,7 +1335,7 @@ def process_career_page(
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
-                career_page_url=career_page_url,
+                career_page_url=root_career_page_url,
                 seed=seed,
                 reason=reason,
                 checked_at=checked_at,
@@ -1268,7 +1356,7 @@ def process_career_page(
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
-                career_page_url=career_page_url,
+                career_page_url=root_career_page_url,
                 seed=seed,
                 reason=reason,
                 checked_at=checked_at,
@@ -1287,7 +1375,60 @@ def process_career_page(
 
         time.sleep(SLEEP_SECONDS)
 
-    return rows, raw
+    return rows, raw, next_pages
+
+
+def process_career_page(
+    context,
+    client: genai.Client,
+    company_domain: str,
+    career_page_url: str,
+    ref: Dict[str, Any],
+    checked_at: str,
+    skipped_jobs_debug: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Process the provided career page first.
+    If that page has no jobs, explore likely secondary pages linked from it.
+    """
+    all_rows = []
+    raw_items = []
+
+    queue = [normalize_url(career_page_url)]
+    visited = set()
+
+    while queue and len(visited) < MAX_SECONDARY_PAGES_PER_COMPANY:
+        current_page_url = queue.pop(0)
+        if not current_page_url or current_page_url in visited:
+            continue
+
+        visited.add(current_page_url)
+
+        rows, raw, next_pages = process_single_rendered_page(
+            context=context,
+            client=client,
+            company_domain=company_domain,
+            root_career_page_url=career_page_url,
+            page_url=current_page_url,
+            ref=ref,
+            checked_at=checked_at,
+            skipped_jobs_debug=skipped_jobs_debug,
+        )
+
+        raw_items.append(raw)
+        all_rows.extend(rows)
+
+        if rows:
+            break
+
+        for next_page in next_pages:
+            next_page = normalize_url(next_page)
+            if next_page and next_page not in visited and next_page not in queue:
+                queue.append(next_page)
+
+        time.sleep(SLEEP_SECONDS)
+
+    return all_rows, raw_items
 
 
 def process_domain_discovery(
@@ -1304,7 +1445,7 @@ def process_domain_discovery(
     raw_items = []
 
     for career_url in career_urls[:5]:
-        rows, raw = process_career_page(
+        rows, raws = process_career_page(
             context=context,
             client=client,
             company_domain=domain,
@@ -1315,7 +1456,7 @@ def process_domain_discovery(
         )
 
         all_rows.extend(rows)
-        raw_items.append(raw)
+        raw_items.extend(raws)
 
         if all_rows:
             break
@@ -1345,8 +1486,8 @@ def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return output
 
 
-def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
+def write_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
@@ -1402,7 +1543,7 @@ def main() -> None:
 
                 print(f"\n[INFO] Career page {index}/{len(direct_pages)}: {career_page}")
 
-                rows, raw = process_career_page(
+                rows, raws = process_career_page(
                     context=context,
                     client=client,
                     company_domain=domain,
@@ -1413,7 +1554,7 @@ def main() -> None:
                 )
 
                 all_rows.extend(rows)
-                raw_results.append(raw)
+                raw_results.extend(raws)
 
                 time.sleep(SLEEP_SECONDS)
 
@@ -1447,8 +1588,8 @@ def main() -> None:
     all_rows = dedupe_rows(all_rows)
     all_rows = all_rows[:MAX_JOBS_OUTPUT]
 
-    write_csv(OUTPUT_CSV_PATH, all_rows, FIELDNAMES)
-    write_csv(SKIPPED_JOBS_CSV_PATH, skipped_jobs_debug, SKIPPED_FIELDNAMES)
+    write_csv(str(OUTPUT_CSV_PATH), all_rows, FIELDNAMES)
+    write_csv(str(SKIPPED_JOBS_CSV_PATH), skipped_jobs_debug, SKIPPED_FIELDNAMES)
     write_json(RAW_JSON_PATH, raw_results)
 
     print("\n[DONE]")
